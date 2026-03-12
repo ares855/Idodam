@@ -14,12 +14,11 @@ INFO_URL_NEW = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwPFINd9ZeNRBtZ
 LOG_FILE = "attendance_log.csv"
 USER_FILE = "users.csv"
 PAYMENT_FILE = "payment_log.csv"
+PARKING_FILE = "parking_log.csv"
+VEHICLE_FILE = "vehicle_registry.csv"
 
 DATE_FMT = "%Y-%m-%d"
 STATUS_OPTIONS = ["미체크", "출석", "결석", "보강", "일정변경"]
-
-# 운영 중 선생님 리스트가 고정이라면 유지, 아니면 참고용으로만 사용
-TEACHERS_LIST = ["김동규", "한다현", "김희애", "장은비", "정진규", "김은정"]
 
 
 # ==========================================
@@ -38,8 +37,12 @@ def load_data(file_path, columns):
 
     try:
         df = pd.read_csv(file_path)
+
         if "날짜" in df.columns:
             df["날짜"] = df["날짜"].apply(normalize_date)
+        if "수업일자" in df.columns:
+            df["수업일자"] = df["수업일자"].apply(normalize_date)
+
         return df
     except Exception as e:
         st.error(f"{file_path} 불러오기 실패: {e}")
@@ -56,10 +59,6 @@ def get_day_prefix(target_date):
 
 
 def normalize_name_column(df):
-    """
-    이름 컬럼을 '성명'으로 표준화
-    실패 시 원본 반환하지 않고 명확히 오류 발생
-    """
     candidate_cols = ["성명", "이름", "학생 이름", "아동명", "성함", "이용자명", "이름(성명)"]
 
     for col in candidate_cols:
@@ -74,41 +73,188 @@ def normalize_name_column(df):
     raise ValueError(f"이름 컬럼을 찾을 수 없습니다. 현재 컬럼: {list(df.columns)}")
 
 
+def get_profile_value(row, candidates, default=""):
+    for col in candidates:
+        value = row.get(col)
+        if pd.notna(value) and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def is_time_range_text(text):
+    text = str(text).strip()
+    patterns = [
+        r"^\d{1,2}:\d{2}\s*[-~]\s*\d{1,2}:\d{2}$",
+        r"^\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}$",
+        r"^\d{1,2}:\d{2}\s*~\s*\d{1,2}:\d{2}$",
+    ]
+    return any(re.match(p, text) for p in patterns)
+
+
+def looks_like_non_student_cell(text):
+    """
+    기관명/장소/메모성 셀 필터
+    """
+    t = str(text).strip()
+    if not t:
+        return True
+
+    lower_t = t.lower()
+    invalid_exact = {
+        "nan", "none", "-", "--", "---", "없음", "없음.", "미정", "공란",
+        "빈칸", "결석", "보강", "취소", "휴강", "테스트"
+    }
+    if lower_t in invalid_exact:
+        return True
+
+    # 시간 범위만 적힌 셀 제외
+    if is_time_range_text(t):
+        return True
+
+    # 기관/장소/메모 키워드
+    keywords = [
+        "어린이집", "유치원", "초", "초등", "중학교", "고등학교", "학교",
+        "복지타운", "복지관", "센터", "기관수업", "수업진행", "기관",
+        "운암초", "홍재복지타운", "도이", "시립", "기관 방문"
+    ]
+    if any(k in t for k in keywords):
+        return True
+
+    return False
+
+
+def split_name_candidates(text):
+    """
+    이름 후보 분리
+    - 줄바꿈 / / , + 기준 분리
+    - 공백 하나로는 분리하지 않음
+    """
+    text = str(text).replace("\r", "\n")
+    text = re.sub(r"\n+", "\n", text)
+    parts = re.split(r"[\n/,+]", text)
+    return [p.strip() for p in parts if p and str(p).strip()]
+
+
+def normalize_name_token(token):
+    """
+    이름 토큰 정제
+    """
+    t = str(token).strip()
+    if not t:
+        return ""
+
+    # 괄호 제거
+    t = re.sub(r"\(.*?\)", "", t)
+    # 날짜 제거
+    t = re.sub(r"\b\d{1,2}/\d{1,2}\b", "", t)
+    # 나이 표기 제거 (예: 11세)
+    t = re.sub(r"\d+\s*세", "", t)
+    # 시작 표기 제거
+    t = re.sub(r"\d{1,2}/\d{1,2}\s*시작", "", t)
+    # 기타 잡문구 제거
+    t = re.sub(r"자전거/?\d*분?", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # 뒤에 숫자만 붙은 경우 제거
+    t = re.sub(r"\d+$", "", t).strip()
+
+    return t
+
+
 def clean_child_names(raw_value):
     """
-    아동명 정제
-    - 괄호 제거: 고다온(4/14) -> 고다온
-    - 날짜 제거: 4/14
-    - 구분자 / , + 로 복수 이름 분리
-    - 공백 하나로 이름을 쪼개지 않음
+    시간표 셀에서 아동명만 최대한 안정적으로 추출
     """
     if pd.isna(raw_value):
         return []
 
     text = str(raw_value).strip()
-    if not text or text.lower() == "nan":
+    if not text:
         return []
 
-    text = re.sub(r"\(.*?\)", "", text)          # 괄호 내용 제거
-    text = re.sub(r"\b\d{1,2}/\d{1,2}\b", "", text)  # 날짜 제거
-    text = re.sub(r"\s+", " ", text).strip()
+    if looks_like_non_student_cell(text):
+        return []
 
-    parts = re.split(r"[/,+]", text)
-
+    parts = split_name_candidates(text)
     names = []
-    for p in parts:
-        name = p.strip()
-        if name:
-            names.append(name)
 
-    return names
+    for part in parts:
+        part = normalize_name_token(part)
+
+        if not part:
+            continue
+        if looks_like_non_student_cell(part):
+            continue
+        if is_time_range_text(part):
+            continue
+        if len(part) < 2:
+            continue
+        if not re.search(r"[가-힣A-Za-z]", part):
+            continue
+
+        # 숫자가 대부분인 값 제거
+        digits_only = re.sub(r"[^0-9]", "", part)
+        if digits_only and len(digits_only) >= len(part) - 1:
+            continue
+
+        names.append(part)
+
+    # 중복 제거 (순서 유지)
+    unique_names = list(dict.fromkeys(names))
+    return unique_names
+
+
+def detect_header_rows(df_sheet):
+    """
+    요일 행 / 선생님 행 자동 탐지
+    """
+    day_candidates = {"월", "화", "수", "목", "금", "토", "일"}
+    best_row_idx = None
+    best_score = -1
+
+    max_check_rows = min(10, len(df_sheet))
+
+    for row_idx in range(max_check_rows):
+        row_values = [str(v).strip() for v in df_sheet.iloc[row_idx].tolist()]
+        score = sum(1 for v in row_values if v in day_candidates)
+
+        if score > best_score:
+            best_score = score
+            best_row_idx = row_idx
+
+    if best_row_idx is None or best_score <= 0:
+        raise ValueError("요일 행을 찾지 못했습니다.")
+
+    teacher_row_idx = best_row_idx + 1
+    if teacher_row_idx >= len(df_sheet):
+        raise ValueError("선생님 행을 찾지 못했습니다.")
+
+    return best_row_idx, teacher_row_idx
+
+
+def parse_time_value(hour_raw, minute_raw):
+    try:
+        hour_text = str(hour_raw).replace("시", "").strip()
+        minute_text = str(minute_raw).replace("분", "").strip()
+
+        if hour_text == "" or minute_text == "":
+            return None
+
+        hour = str(int(float(hour_text))).zfill(2)
+        minute = str(int(float(minute_text))).zfill(2)
+
+        return f"{hour}:{minute}"
+    except Exception:
+        return None
 
 
 # ==========================================
 # [3] 외부 데이터 가져오기
 # ==========================================
 @st.cache_data(ttl=60)
-def fetch_sheet(url):
+def fetch_sheet(url, header="infer"):
+    if header is None:
+        return pd.read_csv(url, header=None)
     return pd.read_csv(url)
 
 
@@ -131,45 +277,97 @@ def get_profiles():
 
 
 # ==========================================
-# [4] 아이도담 시간표 전용 파서
+# [4] 차량번호 관리
+# ==========================================
+def get_vehicle_number_for_child(child_name, profiles, vehicle_df):
+    """
+    1순위: 로컬 차량번호 관리 파일
+    2순위: 구글폼 원본 프로필
+    """
+    child_name = str(child_name).strip()
+
+    if not vehicle_df.empty:
+        vdf = vehicle_df.copy()
+        vdf["아동명"] = vdf["아동명"].fillna("").astype(str).str.strip()
+        found = vdf[vdf["아동명"] == child_name]
+        if not found.empty:
+            found = found.copy()
+            found["updated_at_dt"] = pd.to_datetime(found["updated_at"], errors="coerce")
+            found = found.sort_values("updated_at_dt", ascending=False)
+            latest = found.iloc[0]
+            vehicle_no = str(latest.get("차량번호", "")).strip()
+            if vehicle_no:
+                return vehicle_no
+
+    pdf = profiles.copy()
+    pdf["성명"] = pdf["성명"].fillna("").astype(str).str.strip()
+    matched = pdf[pdf["성명"] == child_name]
+    if matched.empty:
+        return ""
+
+    row = matched.iloc[0]
+    return get_profile_value(
+        row,
+        [
+            "8. 이용하시는 차량번호 (센터 이용 시 필요한 경우에만 기재해 주세요.)",
+            "이용하시는차량번호",
+            "차량번호",
+            "이용 차량번호",
+            "보호자 차량번호"
+        ],
+        default=""
+    )
+
+
+def upsert_vehicle_number(vehicle_df, child_name, vehicle_no, updated_by):
+    new_row = pd.DataFrame([{
+        "아동명": str(child_name).strip(),
+        "차량번호": str(vehicle_no).strip(),
+        "updated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_by": str(updated_by).strip()
+    }])
+
+    if vehicle_df.empty:
+        return new_row
+
+    result = vehicle_df.copy()
+    result["아동명"] = result["아동명"].fillna("").astype(str).str.strip()
+    result = result[result["아동명"] != str(child_name).strip()]
+    result = pd.concat([result, new_row], ignore_index=True)
+    return result
+
+
+# ==========================================
+# [5] 시간표 동기화
 # ==========================================
 def build_attendance_entries(target_date, df_sheet):
     """
-    아이도담 시간표 구조 전용
-    가정:
-    - 0행: 요일 블록 (월/화/수/목/금/토)
-    - 1행: 선생님 이름
-    - 2행 이후: 실제 수업 데이터
-    - 0열: 시
-    - 1열: 분
+    시간표 동기화 안정화 버전
+    - 헤더 행 자동 탐지
+    - 오늘 요일 블록 탐지
+    - 기관/시간범위/메모성 셀 제외
     """
     if df_sheet.empty or df_sheet.shape[0] < 3:
-        raise ValueError("시간표 데이터가 너무 짧습니다. 최소 3행 이상 필요합니다.")
+        raise ValueError("시간표 데이터가 너무 짧습니다.")
 
     day_prefix = get_day_prefix(target_date)
     date_str = target_date.strftime(DATE_FMT)
 
-    # 원본 훼손 방지
     df_sheet = df_sheet.copy()
-
-    # 첫 번째 열(시) 빈칸 채우기
     df_sheet.iloc[:, 0] = df_sheet.iloc[:, 0].ffill()
 
-    # 헤더 2줄
-    day_row = df_sheet.iloc[0]
-    teacher_row = df_sheet.iloc[1]
+    day_row_idx, teacher_row_idx = detect_header_rows(df_sheet)
+    day_row = df_sheet.iloc[day_row_idx]
+    teacher_row = df_sheet.iloc[teacher_row_idx]
+    body = df_sheet.iloc[teacher_row_idx + 1:].copy()
 
-    # 본문
-    body = df_sheet.iloc[2:].copy()
-
-    # 오늘 요일 블록에 해당하는 컬럼 인덱스 찾기
     today_cols = []
     current_day = None
 
-    for col_idx in range(len(df_sheet.columns)):
+    for col_idx in range(df_sheet.shape[1]):
         top_value = str(day_row.iloc[col_idx]).strip()
 
-        if top_value and not top_value.lower().startswith("unnamed"):
+        if top_value and top_value.lower() != "nan":
             current_day = top_value
 
         if current_day == day_prefix:
@@ -180,35 +378,30 @@ def build_attendance_entries(target_date, df_sheet):
 
     new_entries = []
     parse_errors = []
+    skipped_cells = []
 
     for col_idx in today_cols:
-        # 시간 열 제외
         if col_idx < 2:
             continue
 
         teacher_name = str(teacher_row.iloc[col_idx]).strip()
-        if not teacher_name or teacher_name.lower().startswith("unnamed"):
+        if not teacher_name or teacher_name.lower() == "nan":
             continue
 
         for row_idx, row in body.iterrows():
             child_raw = row.iloc[col_idx]
+            raw_text = "" if pd.isna(child_raw) else str(child_raw).strip()
+
             children = clean_child_names(child_raw)
 
             if not children:
+                if raw_text and raw_text.lower() != "nan":
+                    skipped_cells.append(f"행 {row_idx+1}, 열 {col_idx}, 교사 {teacher_name}: '{raw_text}'")
                 continue
 
-            hour_raw = row.iloc[0]
-            minute_raw = row.iloc[1]
-
-            try:
-                hour_text = str(hour_raw).replace("시", "").strip()
-                minute_text = str(minute_raw).replace("분", "").strip()
-
-                hour = str(int(float(hour_text))).zfill(2)
-                minute = str(int(float(minute_text))).zfill(2)
-                time_str = f"{hour}:{minute}"
-            except Exception as e:
-                parse_errors.append(f"행 {row_idx + 1}, 열 {col_idx}, 교사 {teacher_name}: {e}")
+            time_str = parse_time_value(row.iloc[0], row.iloc[1])
+            if not time_str:
+                parse_errors.append(f"행 {row_idx+1}, 열 {col_idx}, 교사 {teacher_name}: 시간 파싱 실패")
                 continue
 
             for child_name in children:
@@ -223,18 +416,30 @@ def build_attendance_entries(target_date, df_sheet):
                 })
 
     parsed_df = pd.DataFrame(new_entries)
-    return parsed_df, parse_errors
+
+    if not parsed_df.empty:
+        parsed_df = parsed_df.drop_duplicates(
+            subset=["날짜", "시간", "선생님", "아동명"],
+            keep="first"
+        )
+
+    debug_info = {
+        "day_row_idx": day_row_idx,
+        "teacher_row_idx": teacher_row_idx,
+        "today_cols": today_cols,
+        "parsed_count": len(parsed_df),
+        "parse_error_count": len(parse_errors),
+        "skipped_count": len(skipped_cells)
+    }
+
+    return parsed_df, parse_errors, skipped_cells, debug_info
 
 
 def merge_new_schedule(existing_df, new_df):
-    """
-    기존 기록은 유지하고 새 수업만 추가
-    중복 기준: 날짜, 시간, 선생님, 아동명
-    """
+    key_cols = ["날짜", "시간", "선생님", "아동명"]
+
     if new_df.empty:
         return existing_df, 0
-
-    key_cols = ["날짜", "시간", "선생님", "아동명"]
 
     if existing_df.empty:
         merged = pd.concat([existing_df, new_df], ignore_index=True)
@@ -248,7 +453,7 @@ def merge_new_schedule(existing_df, new_df):
 
 
 # ==========================================
-# [5] 세션 초기화
+# [6] 세션 초기화
 # ==========================================
 if "df" not in st.session_state:
     st.session_state.df = load_data(
@@ -262,7 +467,6 @@ if "users" not in st.session_state:
         ["userid", "password", "name", "role", "approved"]
     )
 
-    # 주의: 운영 배포용으로는 비밀번호 해시 저장 권장
     if st.session_state.users[st.session_state.users["userid"] == "ares855"].empty:
         admin_df = pd.DataFrame([{
             "userid": "ares855",
@@ -280,44 +484,119 @@ if "payments" not in st.session_state:
         ["아동명", "수납상태", "금액", "결제일", "비고"]
     )
 
+if "parking" not in st.session_state:
+    st.session_state.parking = load_data(
+        PARKING_FILE,
+        ["등록일시", "수업일자", "아동명", "차량번호", "등록교사", "비고"]
+    )
+
+if "vehicles" not in st.session_state:
+    st.session_state.vehicles = load_data(
+        VEHICLE_FILE,
+        ["아동명", "차량번호", "updated_at", "updated_by"]
+    )
+
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
+if "last_parse_errors" not in st.session_state:
+    st.session_state["last_parse_errors"] = []
+
+if "last_skipped_cells" not in st.session_state:
+    st.session_state["last_skipped_cells"] = []
+
+if "last_header_info" not in st.session_state:
+    st.session_state["last_header_info"] = {}
+
 
 # ==========================================
-# [6] 로그인
+# [7] 로그인 / 회원가입
 # ==========================================
 if not st.session_state.logged_in:
     st.title("🏃 아이도담 통합 관리 시스템")
 
-    login_id = st.text_input("아이디")
-    login_pw = st.text_input("비밀번호", type="password")
+    tab_login, tab_signup = st.tabs(["로그인", "선생님 회원가입"])
 
-    if st.button("로그인"):
-        users_df = st.session_state.users
-        match = users_df[users_df["userid"] == login_id]
+    with tab_login:
+        login_id = st.text_input("아이디", key="login_id")
+        login_pw = st.text_input("비밀번호", type="password", key="login_pw")
 
-        if match.empty:
-            st.error("존재하지 않는 아이디입니다.")
-        elif str(match.iloc[0]["password"]) != str(login_pw):
-            st.error("비밀번호가 일치하지 않습니다.")
-        elif str(match.iloc[0]["approved"]) == "No":
-            st.warning("원장님의 승인이 필요한 계정입니다.")
-        else:
-            st.session_state.logged_in = True
-            st.session_state.user_info = match.iloc[0].to_dict()
-            st.rerun()
+        if st.button("로그인", key="login_btn"):
+            users_df = st.session_state.users
+            match = users_df[users_df["userid"] == login_id]
+
+            if match.empty:
+                st.error("존재하지 않는 아이디입니다.")
+            elif str(match.iloc[0]["password"]) != str(login_pw):
+                st.error("비밀번호가 일치하지 않습니다.")
+            elif str(match.iloc[0]["approved"]) == "No":
+                st.warning("원장님의 승인이 필요한 계정입니다.")
+            else:
+                st.session_state.logged_in = True
+                st.session_state.user_info = match.iloc[0].to_dict()
+                st.rerun()
+
+    with tab_signup:
+        st.write("신규 선생님 계정을 등록합니다. 가입 후 원장님 승인 후 로그인할 수 있습니다.")
+
+        signup_name = st.text_input("이름", key="signup_name")
+        signup_id = st.text_input("아이디", key="signup_id")
+        signup_pw = st.text_input("비밀번호", type="password", key="signup_pw")
+        signup_pw_confirm = st.text_input("비밀번호 확인", type="password", key="signup_pw_confirm")
+
+        if st.button("회원가입 신청", key="signup_btn"):
+            users_df = st.session_state.users
+
+            signup_name = signup_name.strip()
+            signup_id = signup_id.strip()
+            signup_pw = signup_pw.strip()
+            signup_pw_confirm = signup_pw_confirm.strip()
+
+            if not signup_name:
+                st.error("이름을 입력해 주세요.")
+            elif not signup_id:
+                st.error("아이디를 입력해 주세요.")
+            elif not signup_pw:
+                st.error("비밀번호를 입력해 주세요.")
+            elif signup_pw != signup_pw_confirm:
+                st.error("비밀번호와 비밀번호 확인이 일치하지 않습니다.")
+            elif len(signup_pw) < 4:
+                st.error("비밀번호는 4자 이상 입력해 주세요.")
+            elif not users_df[users_df["userid"] == signup_id].empty:
+                st.error("이미 사용 중인 아이디입니다.")
+            else:
+                new_user = pd.DataFrame([{
+                    "userid": signup_id,
+                    "password": signup_pw,
+                    "name": signup_name,
+                    "role": "선생님",
+                    "approved": "No"
+                }])
+
+                st.session_state.users = pd.concat(
+                    [st.session_state.users, new_user],
+                    ignore_index=True
+                )
+                save_data(st.session_state.users, USER_FILE)
+                st.success("회원가입 신청이 완료되었습니다. 원장님 승인 후 로그인할 수 있습니다.")
 
     st.stop()
 
 
 # ==========================================
-# [7] 메뉴
+# [8] 메뉴
 # ==========================================
 user = st.session_state.user_info
 is_admin = (user["userid"] == "ares855")
 
-menu_options = ["🏠 대시보드", "📝 오늘의 출석부", "💰 수납 관리", "🔍 아동 프로필"]
+menu_options = [
+    "🏠 대시보드",
+    "📝 오늘의 출석부",
+    "💰 수납 관리",
+    "🔍 아동 프로필",
+    "🚗 주차 등록",
+    "📋 출결 조회"
+]
 if is_admin:
     menu_options.append("⚙️ 관리자 및 디버그")
 
@@ -325,7 +604,7 @@ menu = st.sidebar.radio("메뉴 선택", menu_options)
 
 
 # ==========================================
-# [8] 대시보드
+# [9] 대시보드
 # ==========================================
 if menu == "🏠 대시보드":
     st.title("🏃 아이도담 대시보드")
@@ -339,11 +618,14 @@ if menu == "🏠 대시보드":
     c3.metric("미체크", len(today_df[today_df["출결상태"] == "미체크"]))
 
     st.subheader("오늘 수업 현황")
-    st.dataframe(today_df.sort_values(by=["시간", "선생님", "아동명"]), use_container_width=True)
+    if not today_df.empty:
+        st.dataframe(today_df.sort_values(by=["시간", "선생님", "아동명"]), use_container_width=True)
+    else:
+        st.info("오늘 등록된 수업이 없습니다.")
 
 
 # ==========================================
-# [9] 오늘의 출석부
+# [10] 오늘의 출석부
 # ==========================================
 elif menu == "📝 오늘의 출석부":
     st.header(f"📅 {user['name']} 선생님 출석부")
@@ -353,12 +635,16 @@ elif menu == "📝 오늘의 출석부":
 
     if st.button("🔄 구글 시트에서 새 스케줄 동기화"):
         try:
-            raw_sheet = fetch_sheet(SCHEDULE_URL)
-            new_df, parse_errors = build_attendance_entries(target_date, raw_sheet)
+            raw_sheet = fetch_sheet(SCHEDULE_URL, header=None)
+            new_df, parse_errors, skipped_cells, debug_info = build_attendance_entries(target_date, raw_sheet)
 
             merged_df, added_count = merge_new_schedule(st.session_state.df, new_df)
             st.session_state.df = merged_df
             save_data(st.session_state.df, LOG_FILE)
+
+            st.session_state["last_parse_errors"] = parse_errors
+            st.session_state["last_skipped_cells"] = skipped_cells
+            st.session_state["last_header_info"] = debug_info
 
             if added_count > 0:
                 st.success(f"{added_count}개의 새 수업을 추가했습니다.")
@@ -367,9 +653,8 @@ elif menu == "📝 오늘의 출석부":
 
             if parse_errors:
                 st.warning(f"시간 파싱 실패 {len(parse_errors)}건이 있습니다. 관리자 디버그 탭에서 확인하세요.")
-                st.session_state["last_parse_errors"] = parse_errors
-            else:
-                st.session_state["last_parse_errors"] = []
+            if skipped_cells:
+                st.info(f"이름으로 인식되지 않아 제외된 셀 {len(skipped_cells)}건이 있습니다. 관리자 디버그 탭에서 확인하세요.")
 
             st.rerun()
 
@@ -403,14 +688,11 @@ elif menu == "📝 오늘의 출석부":
                 new_note = c2.text_input("특이사항", value=note_value, key=f"note_{idx}")
 
                 if c3.button("저장", key=f"save_{idx}"):
-                    # 공동 수업 동기화:
-                    # 같은 날짜, 시간, 아동명인 모든 기록 갱신
                     mask = (
                         (st.session_state.df["날짜"] == target_date_str) &
                         (st.session_state.df["시간"] == row["시간"]) &
                         (st.session_state.df["아동명"] == row["아동명"])
                     )
-
                     st.session_state.df.loc[mask, ["출결상태", "특이사항"]] = [new_status, new_note]
                     save_data(st.session_state.df, LOG_FILE)
                     st.success("저장되었습니다.")
@@ -418,7 +700,7 @@ elif menu == "📝 오늘의 출석부":
 
 
 # ==========================================
-# [10] 수납 관리
+# [11] 수납 관리
 # ==========================================
 elif menu == "💰 수납 관리":
     st.title("💰 수납 현황 관리")
@@ -434,7 +716,7 @@ elif menu == "💰 수납 관리":
                         payment_df = pd.read_csv(up_file)
 
                     st.session_state.payments = payment_df
-                    save_data(st.session_state.payments, PAYMENT_FILE)
+                    save_data(payment_df, PAYMENT_FILE)
                     st.success("수납 데이터가 업데이트되었습니다.")
                 except Exception as e:
                     st.error(f"수납 파일 처리 실패: {e}")
@@ -451,7 +733,7 @@ elif menu == "💰 수납 관리":
 
 
 # ==========================================
-# [11] 아동 프로필
+# [12] 아동 프로필
 # ==========================================
 elif menu == "🔍 아동 프로필":
     st.title("📂 아동 상세 프로필")
@@ -468,21 +750,172 @@ elif menu == "🔍 아동 프로필":
             if selected_child:
                 d = profiles[profiles["성명"] == selected_child].iloc[0]
 
-                st.info(f"📞 비상 연락처: {d.get('비상 연락처', '미기재')}")
-                st.error(f"⚠️ 주의사항: {d.get('신체 상태 및 주의사항', '없음')}")
-                st.write(f"📝 선생님께 바라는 점: {d.get('담당 선생님께 바라는 부분', '내용 없음')}")
+                with st.expander("원본 프로필 전체 보기", expanded=True):
+                    display_series = d.dropna()
+                    st.dataframe(display_series.to_frame(name="내용"), use_container_width=True)
 
     except Exception as e:
         st.error(f"신상 정보 로딩 실패: {e}")
 
 
 # ==========================================
-# [12] 관리자 및 디버그
+# [13] 주차 등록
+# ==========================================
+elif menu == "🚗 주차 등록":
+    st.title("🚗 주차 등록")
+
+    try:
+        profiles = get_profiles()
+
+        if profiles.empty:
+            st.warning("프로필 데이터를 불러올 수 없습니다.")
+        else:
+            c1, c2 = st.columns([2, 1])
+            search_name = c1.text_input("아동명 검색", placeholder="예: 김시윤")
+            parking_date = c2.date_input("수업일자", date.today())
+
+            if search_name.strip():
+                profile_search = profiles.copy()
+                profile_search["성명"] = profile_search["성명"].fillna("").astype(str).str.strip()
+
+                matched = profile_search[
+                    profile_search["성명"].str.contains(search_name.strip(), na=False)
+                ].copy()
+
+                if matched.empty:
+                    st.warning("검색된 아동이 없습니다.")
+                else:
+                    st.subheader("검색 결과")
+
+                    for idx, (_, row) in enumerate(matched.iterrows()):
+                        child_name = str(row["성명"]).strip()
+
+                        default_car_number = get_vehicle_number_for_child(
+                            child_name,
+                            profiles,
+                            st.session_state.vehicles
+                        )
+
+                        with st.expander(f"{child_name}", expanded=True):
+                            st.write(f"아동명: {child_name}")
+
+                            edited_car_number = st.text_input(
+                                "차량번호",
+                                value=default_car_number,
+                                key=f"car_number_{idx}"
+                            )
+
+                            memo = st.text_input(
+                                "비고",
+                                key=f"parking_memo_{idx}",
+                                placeholder="예: 주차시스템 등록 완료"
+                            )
+
+                            c_save1, c_save2 = st.columns([1, 3])
+
+                            if c_save1.button("저장", key=f"parking_save_{idx}"):
+                                # 차량번호 로컬 관리 테이블 업데이트
+                                st.session_state.vehicles = upsert_vehicle_number(
+                                    st.session_state.vehicles,
+                                    child_name,
+                                    edited_car_number.strip(),
+                                    user["name"]
+                                )
+                                save_data(st.session_state.vehicles, VEHICLE_FILE)
+
+                                # 주차 등록 로그 저장
+                                new_row = pd.DataFrame([{
+                                    "등록일시": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "수업일자": parking_date.strftime(DATE_FMT),
+                                    "아동명": child_name,
+                                    "차량번호": edited_car_number.strip(),
+                                    "등록교사": user["name"],
+                                    "비고": memo
+                                }])
+
+                                st.session_state.parking = pd.concat(
+                                    [st.session_state.parking, new_row],
+                                    ignore_index=True
+                                )
+                                save_data(st.session_state.parking, PARKING_FILE)
+
+                                st.success("차량번호 저장 및 주차 등록이 완료되었습니다.")
+                                st.rerun()
+
+            st.subheader("최근 주차 등록 내역")
+            parking_view = st.session_state.parking.copy()
+
+            if not parking_view.empty:
+                parking_view["등록일시_dt"] = pd.to_datetime(parking_view["등록일시"], errors="coerce")
+                parking_view = parking_view.sort_values("등록일시_dt", ascending=False).drop(columns=["등록일시_dt"])
+                st.dataframe(parking_view.head(30), use_container_width=True)
+            else:
+                st.info("저장된 주차 등록 내역이 없습니다.")
+
+    except Exception as e:
+        st.error(f"주차 등록 기능 오류: {e}")
+
+
+# ==========================================
+# [14] 출결 조회
+# ==========================================
+elif menu == "📋 출결 조회":
+    st.title("📋 아동 출결 조회")
+
+    attendance_df = st.session_state.df.copy()
+
+    if attendance_df.empty:
+        st.info("출결 데이터가 없습니다.")
+    else:
+        today = date.today()
+        start_default = today.replace(day=1)
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        search_name = c1.text_input("아동명 검색", placeholder="예: 김시윤")
+        start_date = c2.date_input("조회 시작일", start_default)
+        end_date = c3.date_input("조회 종료일", today)
+
+        if search_name.strip():
+            df_search = attendance_df.copy()
+            df_search["아동명"] = df_search["아동명"].fillna("").astype(str).str.strip()
+            df_search["날짜_dt"] = pd.to_datetime(df_search["날짜"], errors="coerce")
+
+            mask = (
+                (df_search["아동명"].str.contains(search_name.strip(), na=False)) &
+                (df_search["날짜_dt"] >= pd.to_datetime(start_date)) &
+                (df_search["날짜_dt"] <= pd.to_datetime(end_date))
+            )
+
+            result_df = df_search[mask].copy()
+
+            st.subheader("조회 결과 요약")
+
+            a1, a2, a3, a4, a5 = st.columns(5)
+            a1.metric("전체", len(result_df))
+            a2.metric("출석", len(result_df[result_df["출결상태"] == "출석"]))
+            a3.metric("결석", len(result_df[result_df["출결상태"] == "결석"]))
+            a4.metric("보강", len(result_df[result_df["출결상태"] == "보강"]))
+            a5.metric("미체크/기타", len(result_df[~result_df["출결상태"].isin(["출석", "결석", "보강"])]))
+
+            if result_df.empty:
+                st.info("해당 기간에 조회된 출결 내역이 없습니다.")
+            else:
+                result_df = result_df.sort_values(by=["날짜_dt", "시간", "선생님"])
+                st.dataframe(
+                    result_df[["날짜", "요일", "시간", "선생님", "아동명", "출결상태", "특이사항"]],
+                    use_container_width=True
+                )
+        else:
+            st.info("아동명을 입력하면 출결 내역을 조회할 수 있습니다.")
+
+
+# ==========================================
+# [15] 관리자 및 디버그
 # ==========================================
 elif menu == "⚙️ 관리자 및 디버그":
     st.title("🛠️ 관리자 및 디버그")
 
-    tab1, tab2, tab3 = st.tabs(["가입 승인", "데이터 진단", "사용자 목록"])
+    tab1, tab2, tab3, tab4 = st.tabs(["가입 승인", "시간표 진단", "신상카드 진단", "사용자 목록"])
 
     with tab1:
         st.subheader("가입 승인")
@@ -501,30 +934,58 @@ elif menu == "⚙️ 관리자 및 디버그":
                     st.rerun()
 
     with tab2:
-        st.subheader("실시간 데이터 진단")
+        st.subheader("시간표 진단")
 
         if st.button("시간표 시트 구조 확인"):
             try:
-                raw_sheet = fetch_sheet(SCHEDULE_URL)
-                st.write("컬럼명:", raw_sheet.columns.tolist())
-                st.dataframe(raw_sheet.head(10), use_container_width=True)
+                raw_sheet = fetch_sheet(SCHEDULE_URL, header=None)
+                st.write("시간표 shape:", raw_sheet.shape)
+                st.dataframe(raw_sheet.head(15), use_container_width=True)
             except Exception as e:
                 st.error(f"시간표 시트 확인 실패: {e}")
 
         if st.button("오늘 요일 파싱 결과 확인"):
             try:
-                raw_sheet = fetch_sheet(SCHEDULE_URL)
-                parsed_df, parse_errors = build_attendance_entries(date.today(), raw_sheet)
-                st.write("파싱된 수업 개수:", len(parsed_df))
-                st.dataframe(parsed_df.head(30), use_container_width=True)
+                raw_sheet = fetch_sheet(SCHEDULE_URL, header=None)
+                parsed_df, parse_errors, skipped_cells, debug_info = build_attendance_entries(date.today(), raw_sheet)
+
+                st.write("감지된 요일 행:", debug_info.get("day_row_idx"))
+                st.write("감지된 선생님 행:", debug_info.get("teacher_row_idx"))
+                st.write("오늘 요일 컬럼 인덱스:", debug_info.get("today_cols"))
+                st.write("파싱된 수업 개수:", debug_info.get("parsed_count"))
+                st.dataframe(parsed_df.head(50), use_container_width=True)
 
                 if parse_errors:
-                    st.warning(f"파싱 실패 {len(parse_errors)}건")
-                    st.write(parse_errors[:20])
+                    st.warning(f"시간 파싱 실패 {len(parse_errors)}건")
+                    st.write(parse_errors[:30])
                 else:
-                    st.success("파싱 실패 없음")
+                    st.success("시간 파싱 실패 없음")
+
+                if skipped_cells:
+                    st.info(f"이름으로 인식되지 않아 제외된 셀 {len(skipped_cells)}건")
+                    st.write(skipped_cells[:30])
+
             except Exception as e:
                 st.error(f"파싱 확인 실패: {e}")
+
+        if st.button("캐시 새로고침"):
+            st.cache_data.clear()
+            st.success("캐시를 비웠습니다.")
+
+        if st.session_state["last_header_info"]:
+            st.subheader("최근 동기화 헤더 감지 정보")
+            st.write(st.session_state["last_header_info"])
+
+        if st.session_state["last_parse_errors"]:
+            st.subheader("최근 동기화 시간 파싱 실패")
+            st.write(st.session_state["last_parse_errors"][:30])
+
+        if st.session_state["last_skipped_cells"]:
+            st.subheader("최근 동기화 제외 셀")
+            st.write(st.session_state["last_skipped_cells"][:30])
+
+    with tab3:
+        st.subheader("신상카드 진단")
 
         if st.button("신상카드 시트 구조 확인"):
             try:
@@ -536,23 +997,9 @@ elif menu == "⚙️ 관리자 및 디버그":
                 st.write("신규 신상카드 컬럼:", df2.columns.tolist())
                 st.dataframe(df2.head(5), use_container_width=True)
 
-                n1 = normalize_name_column(df1)
-                n2 = normalize_name_column(df2)
-                st.success("이름 컬럼 자동 탐지 성공")
-                st.write("기존 시트 표준화 후 컬럼:", n1.columns.tolist())
-                st.write("신규 시트 표준화 후 컬럼:", n2.columns.tolist())
-
             except Exception as e:
                 st.error(f"신상카드 진단 실패: {e}")
 
-        if st.button("캐시 새로고침"):
-            st.cache_data.clear()
-            st.success("캐시를 비웠습니다.")
-
-        if "last_parse_errors" in st.session_state and st.session_state["last_parse_errors"]:
-            st.subheader("최근 동기화 파싱 실패 내역")
-            st.write(st.session_state["last_parse_errors"][:30])
-
-    with tab3:
+    with tab4:
         st.subheader("사용자 목록")
         st.dataframe(st.session_state.users, use_container_width=True)
